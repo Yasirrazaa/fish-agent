@@ -1,0 +1,40 @@
+FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.0
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    portaudio19-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire fish-speech package structure
+COPY fish_speech /app/fish-speech/fish_speech/
+COPY tools /app/fish-speech/tools/
+COPY runpod /app/fish-speech/runpod/
+COPY pyproject.toml setup.py requirements.txt /app/fish-speech/
+
+# Install fish-speech
+WORKDIR /app/fish-speech
+RUN pip install -e .[stable]
+
+# Set environment variables
+ENV PYTHONPATH=/app/fish-speech
+ENV MODEL_PATH=/app/checkpoints
+ENV LLAMA_CHECKPOINT_PATH=/app/checkpoints/fish-agent-v0.1-3b
+ENV DECODER_CHECKPOINT_PATH=/app/checkpoints/fish-speech-1.4/firefly-gan-vq-fsq-8x1024-21hz-generator.pth
+ENV DECODER_CONFIG_NAME=base
+ENV MODE=agent
+ENV HALF=true
+ENV COMPILE=true
+ENV ASR_ENABLED=false
+
+# Create necessary directories
+RUN mkdir -p /app/checkpoints/fish-agent-v0.1-3b \
+    && mkdir -p /app/checkpoints/fish-speech-1.4 \
+    && mkdir -p /app/cache \
+    && mkdir -p /app/logs
+
+# Set working directory and start handler
+WORKDIR /app/fish-speech/runpod
+CMD [ "python", "-u", "handler.py" ]
