@@ -1,49 +1,50 @@
-# Use official Python image
-FROM python:3.10-slim
+FROM python:3.12-slim-bookworm AS stage-1
+ARG TARGETARCH
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    LLAMA_CHECKPOINT_PATH="/app/checkpoints/fish-speech-1.5" \
-    DECODER_CHECKPOINT_PATH="/app/checkpoints/fish-speech-1.5/firefly-gan-vq-fsq-8x1024-21hz-generator.pth" \
-    DECODER_CONFIG_NAME="base" \
-    AGENT_CHECKPOINT_PATH=""
+ARG HUGGINGFACE_MODEL=fish-speech-1.5
+ARG HF_ENDPOINT=https://huggingface.co
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+WORKDIR /opt/fish-speech
+
+RUN set -ex \
+    && pip install huggingface_hub \
+    && HF_ENDPOINT=${HF_ENDPOINT} huggingface-cli download --resume-download fishaudio/${HUGGINGFACE_MODEL} --local-dir checkpoints/${HUGGINGFACE_MODEL}
+
+FROM python:3.12-slim-bookworm
+ARG TARGETARCH
+
+ARG DEPENDENCIES="  \
+    ca-certificates \
+    libsox-dev \
     build-essential \
-    libssl-dev \
-    libffi-dev \
-    libxml2-dev \
-    libxslt1-dev \
-    zlib1g-dev \
-    libjpeg-dev \
-    libopenblas-dev \
-    libopenmpi-dev \
-    libsndfile1 \
+    cmake \
+    libasound-dev \
     portaudio19-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libportaudio2 \
+    libportaudiocpp0 \
+    ffmpeg"
 
-# Set working directory
-WORKDIR /app
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -ex \
+    && rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache \
+    && apt-get update \
+    && apt-get -y install --no-install-recommends ${DEPENDENCIES} \
+    && echo "no" | dpkg-reconfigure dash
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+WORKDIR /opt/fish-speech
 
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt && \
-    pip install tiktoken cachetools
+COPY . .
 
-# Copy the entire project
-COPY --chown=1000:1000 . /app/
+RUN --mount=type=cache,target=/root/.cache,sharing=locked \
+    set -ex \
+    && pip install -e .[stable]
 
-# Create checkpoints directory
-RUN mkdir -p /app/checkpoints
+COPY --from=stage-1 /opt/fish-speech/checkpoints /opt/fish-speech/checkpoints
 
-# Expose the port the app runs on
-EXPOSE 8000
+ENV GRADIO_SERVER_NAME="0.0.0.0"
 
-# Command to run the application
-CMD ["uvicorn", "tools.server.fastapi_app:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 7860
+
+CMD ["./entrypoint.sh"]

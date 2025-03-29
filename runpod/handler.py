@@ -1,194 +1,312 @@
+#!/usr/bin/env python
+# RunPod Serverless handler for Fish-Speech Agent
+
 import os
 import sys
-import runpod
-import torch
+import json
+import time
+import asyncio
+import base64
+import traceback
 from typing import Dict, Any
 from loguru import logger
 
-# Add fish-speech to Python path
-repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(repo_root)
+# Add proper path for imports
+sys.path.append("/app/fish-speech")
 
-# Import Fish Speech components
-from fish_speech.utils.schema import ServeChatRequest, ServeMessage, ServeTTSRequest
-from tools.server.model_manager import ModelManager
-from tools.server.agent.generate import generate_responses
-from tools.server.inference import inference_wrapper
+# Configure better logging
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+logger.add("/var/log/runpod_handler.log", rotation="100 MB", retention="1 week")
 
-class RunPodHandler:
+try:
+    import runpod
+    from fish_speech.utils.schema import ServeMessage, ServeTextPart, ServeVQPart
+    from tools.fish_e2e import FishE2EAgent, FishE2EEventType
+except ImportError as e:
+    logger.error(f"Import error: {str(e)}")
+    logger.error("Attempting to install missing packages...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "runpod==1.7.0"])
+    import runpod
+    from fish_speech.utils.schema import ServeMessage, ServeTextPart, ServeVQPart
+    from tools.fish_e2e import FishE2EAgent, FishE2EEventType
+
+
+class ChatState:
     def __init__(self):
-        # Initialize model manager with environment variables
-        self.model_manager = ModelManager(
-            mode=os.getenv("MODE", "agent"),
-            device=os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"),
-            half=os.getenv("HALF", "true").lower() == "true",
-            compile=os.getenv("COMPILE", "true").lower() == "true",
-            asr_enabled=os.getenv("ASR_ENABLED", "false").lower() == "true",
-            llama_checkpoint_path=os.getenv("LLAMA_CHECKPOINT_PATH"),
-            decoder_checkpoint_path=os.getenv("DECODER_CHECKPOINT_PATH"),
-            decoder_config_name=os.getenv("DECODER_CONFIG_NAME", "base"),
+        self.conversation = []
+        self.added_systext = False
+        self.added_sysaudio = False
+
+    def get_history(self):
+        results = []
+        for msg in self.conversation:
+            results.append({"role": msg.role, "content": self.repr_message(msg)})
+        return results
+
+    def repr_message(self, msg: ServeMessage):
+        response = ""
+        for part in msg.parts:
+            if isinstance(part, ServeTextPart):
+                response += part.text
+            elif isinstance(part, ServeVQPart):
+                response += f"<audio {len(part.codes[0]) / 21:.2f}s>"
+        return response
+
+
+# Create a global agent instance to avoid reloading the model for each request
+_AGENT = None
+
+def get_agent():
+    """Initialize the agent if it doesn't exist"""
+    global _AGENT
+    if _AGENT is None:
+        try:
+            # Health check using standard library
+            import urllib.request
+            try:
+                with urllib.request.urlopen("http://localhost:8080/v1/health", timeout=5) as response:
+                    if response.status != 200:
+                        logger.warning(f"API server health check failed: {response.status}")
+            except Exception as e:
+                logger.warning(f"Health check failed: {str(e)}")
+                
+            # Initialize the agent
+            logger.info("Creating FishE2EAgent...")
+            _AGENT = FishE2EAgent()
+            logger.info("FishE2EAgent created successfully")
+        except Exception as e:
+            logger.error(f"Error initializing FishE2EAgent: {str(e)}")
+            
+    return _AGENT
+
+
+async def process_request(job_input):
+    """Process a request using FishE2EAgent"""
+    try:
+        # Get the agent
+        agent = get_agent()
+        if agent is None:
+            raise RuntimeError("Failed to initialize FishE2EAgent")
+        
+        # Create state for this conversation
+        state = ChatState()
+        
+        # Get input parameters
+        text_input = job_input.get('message')
+        if not text_input:
+            raise ValueError("No message provided in the input")
+        
+        logger.info(f"Processing message: {text_input[:50]}...")
+        
+        # Handle optional parameters
+        sys_text = job_input.get('system_message')
+        conversation_id = job_input.get('conversation_id')
+        
+        # Process system audio if provided (base64 encoded)
+        sys_audio_data = None
+        if job_input.get('system_audio'):
+            try:
+                import numpy as np
+                import io
+                import soundfile as sf
+                
+                # Decode base64 audio
+                audio_bytes = base64.b64decode(job_input['system_audio'])
+                with io.BytesIO(audio_bytes) as audio_buffer:
+                    sys_audio_data, sample_rate = sf.read(audio_buffer)
+                    # Convert to float32 if needed
+                    if sys_audio_data.dtype != np.float32:
+                        sys_audio_data = sys_audio_data.astype(np.float32)
+                    
+                    # Ensure audio is mono if it's stereo
+                    if len(sys_audio_data.shape) > 1 and sys_audio_data.shape[1] > 1:
+                        sys_audio_data = np.mean(sys_audio_data, axis=1)
+                
+                logger.info(f"Loaded system audio: {sys_audio_data.shape}")
+            except Exception as e:
+                logger.error(f"Error processing system audio: {str(e)}")
+        
+        # Process system message if provided
+        if sys_text:
+            logger.info(f"Adding system message: {sys_text[:50]}...")
+            state.added_systext = True
+            state.conversation.append(
+                ServeMessage(
+                    role="system",
+                    parts=[ServeTextPart(text=sys_text)]
+                )
+            )
+        
+        # Add user message to conversation
+        state.conversation.append(
+            ServeMessage(
+                role="user",
+                parts=[ServeTextPart(text=text_input)]
+            )
         )
         
-        # Store conversation history
-        self.conversations = {}
+        # Stream responses from agent
+        text_response = ""
+        audio_data = None
         
-        # Do a warmup run
-        logger.info("Warming up models...")
-        self._warmup()
-        logger.info("Models ready")
+        logger.info("Streaming response from agent...")
+        async for event in agent.stream(
+            sys_audio_data=sys_audio_data,
+            user_audio_data=None,
+            sample_rate=44100,
+            num_channels=1,
+            chat_ctx={
+                "messages": state.conversation,
+                "added_sysaudio": state.added_sysaudio,
+            },
+        ):
+            if event.type == FishE2EEventType.TEXT_SEGMENT:
+                text_response += event.text
+                logger.debug(f"Text segment: {event.text}")
+            elif event.type == FishE2EEventType.SPEECH_SEGMENT:
+                audio_data = event.frame.data
+                logger.debug(f"Speech segment received: {len(audio_data)} bytes")
+        
+        # Store assistant response in conversation
+        state.conversation.append(
+            ServeMessage(
+                role="assistant",
+                parts=[ServeTextPart(text=text_response)]
+            )
+        )
+        
+        # Prepare the result
+        result = {
+            "text": text_response,
+            "history": state.get_history()
+        }
+        
+        # Include audio if available, converting to bytes for JSON serialization
+        if audio_data is not None:
+            import numpy as np
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            result["audio"] = audio_array.tolist()
+            # Also provide base64 encoded audio for direct use in web applications
+            audio_bytes = audio_data.tobytes()
+            result["audio_base64"] = base64.b64encode(audio_bytes).decode('utf-8')
+            result["audio_format"] = "wav"
+            result["sample_rate"] = 44100
+        
+        logger.info(f"Response generated: {len(text_response)} chars of text, " + 
+                    (f"{len(audio_data)} bytes of audio" if audio_data else "no audio"))
+        
+        return {
+            "status": "success",
+            "output": result
+        }
 
-    def _warmup(self):
-        """Run a quick warmup to initialize models"""
-        try:
-            # Test text generation
-            request = ServeChatRequest(
-                messages=[
-                    ServeMessage(role="user", parts=[{"type": "text", "text": "Hello"}])
-                ],
-                streaming=False,
-                num_samples=1,
-            )
-            
-            # Generate using agent
-            responses = generate_responses(
-                self.model_manager.llama_queue,
-                self.model_manager.tokenizer,
-                self.model_manager.config,
-                request,
-                torch.tensor([[0]]).to(self.model_manager.device),  # Empty prompt
-                self.model_manager.tokenizer.im_end_id,
-                self.model_manager.device
-            )
-            
-            # Run through one response
-            for _ in responses:
-                break
-            
-            # Test TTS if needed for voice responses
-            tts_request = ServeTTSRequest(
-                text="Hello world",
-                max_new_tokens=100,
-                format="wav"
-            )
-            for _ in inference_wrapper(tts_request, self.model_manager.tts_inference_engine):
-                break
-                
-        except Exception as e:
-            logger.error(f"Warmup failed: {str(e)}")
-            raise
-
-    async def handler(self, job: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle RunPod serverless requests
-        """
-        try:
-            job_id = job.get('id', 'unknown')
-            input_data = job.get('input', {})
-            
-            if not input_data:
-                raise ValueError("No input provided")
-            
-            # Get request parameters
-            message = input_data.get('message')
-            if not message:
-                raise ValueError("No message provided")
-            
-            conversation_id = input_data.get('conversation_id')
-            reference_audio = input_data.get('reference_audio')  # Optional base64 audio
-            temperature = input_data.get('temperature', 0.7)
-            max_tokens = input_data.get('max_tokens', 1000)
-            stream = input_data.get('stream', False)
-            
-            # Get conversation history
-            conversation = []
-            if conversation_id and conversation_id in self.conversations:
-                conversation = self.conversations[conversation_id]
-            
-            # Create chat request
-            chat_request = ServeChatRequest(
-                messages=[
-                    *conversation,
-                    ServeMessage(role="user", parts=[{"type": "text", "text": message}])
-                ],
-                streaming=stream,
-                num_samples=1,
-                temperature=temperature,
-                max_new_tokens=max_tokens
-            )
-            
-            # Generate response
-            responses = generate_responses(
-                self.model_manager.llama_queue,
-                self.model_manager.tokenizer,
-                self.model_manager.config,
-                chat_request,
-                torch.tensor([[0]]).to(self.model_manager.device),  # Empty prompt
-                self.model_manager.tokenizer.im_end_id,
-                self.model_manager.device
-            )
-            
-            # Process responses
-            text_response = ""
-            for response in responses:
-                if stream:
-                    text_response += response.delta.part.text if response.delta and response.delta.part else ""
-                else:
-                    text_response = response.messages[0].parts[0].text
-            
-            # Update conversation history
-            if conversation_id:
-                self.conversations[conversation_id] = [
-                    *chat_request.messages,
-                    ServeMessage(role="assistant", parts=[{"type": "text", "text": text_response}])
-                ][-10:]  # Keep last 10 messages
-            
-            result = {
-                "text": text_response
+    except Exception as e:
+        error_message = str(e)
+        error_trace = traceback.format_exc()
+        logger.error(f"Error processing request: {error_message}\n{error_trace}")
+        
+        return {
+            "status": "error",
+            "output": {
+                "error": error_message,
+                "trace": error_trace
             }
-            
-            # Generate speech if reference audio provided
-            if reference_audio:
-                tts_request = ServeTTSRequest(
-                    text=text_response,
-                    reference_audio=reference_audio,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    format="wav"
-                )
-                
-                audio = None
-                for chunk in inference_wrapper(tts_request, self.model_manager.tts_inference_engine):
-                    audio = chunk
-                
-                if audio:
-                    result["audio"] = audio.tolist()
-            
-            return {
-                "id": job_id,
-                "status": "success",
-                "output": result
-            }
+        }
 
-        except Exception as e:
-            logger.error(f"Error processing job {job_id}: {str(e)}")
+
+def handler(event):
+    """
+    RunPod handler function - processes requests through the Fish-Speech agent
+    """
+    try:
+        job_id = event.get('id', 'unknown')
+        logger.info(f"Handling job {job_id}")
+        
+        input_data = event.get('input', {})
+        if not input_data:
             return {
                 "id": job_id,
                 "status": "error",
-                "error": str(e)
+                "output": {"error": "No input provided"}
             }
-            
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        
+        # Run the async processing in an event loop
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(process_request(input_data))
+        
+        return {
+            "id": job_id,
+            **result
+        }
+    except Exception as e:
+        error_message = str(e)
+        error_trace = traceback.format_exc()
+        logger.error(f"Unexpected error in handler: {error_message}\n{error_trace}")
+        
+        return {
+            "id": event.get('id', 'unknown'),
+            "status": "error",
+            "output": {
+                "error": error_message,
+                "trace": error_trace
+            }
+        }
 
-def main():
-    logger.info("Initializing RunPod handler...")
-    handler = RunPodHandler()
+
+# This allows local testing of the handler
+def local_test():
+    """Run a local test of the handler"""
+    logger.info("Running local test")
     
-    logger.info("Starting RunPod serverless handler...")
-    runpod.serverless.start({
-        "handler": handler.handler
-    })
+    # Check if test_input.json exists, otherwise use default input
+    test_input_path = os.path.join(os.path.dirname(__file__), "test_input.json")
+    if os.path.exists(test_input_path):
+        with open(test_input_path, "r") as f:
+            test_event = json.load(f)
+    else:
+        test_event = {
+            "id": "local_test",
+            "input": {
+                "message": "Hello, how are you today?",
+                "system_message": "You are a helpful assistant."
+            }
+        }
+    
+    # Process the test event
+    result = handler(test_event)
+    
+    # Print the result
+    logger.info(f"Test result: {json.dumps(result, indent=2)}")
+    
+    # Save the output if it includes audio
+    if result.get("status") == "success" and result.get("output", {}).get("audio_base64"):
+        output_dir = os.path.join(os.path.dirname(__file__), "test_output")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the text response
+        with open(os.path.join(output_dir, "response.txt"), "w") as f:
+            f.write(result["output"]["text"])
+        
+        # Save the audio if present
+        if result["output"].get("audio_base64"):
+            audio_bytes = base64.b64decode(result["output"]["audio_base64"])
+            with open(os.path.join(output_dir, "response.wav"), "wb") as f:
+                f.write(audio_bytes)
+            logger.info(f"Audio response saved to {os.path.join(output_dir, 'response.wav')}")
+
 
 if __name__ == "__main__":
-    main()
+    # Add a delay to ensure the API server is ready
+    logger.info("Starting RunPod serverless handler...")
+    logger.info("Waiting for API server to initialize...")
+    time.sleep(5)
+    
+    # Check if we're running a local test or as a serverless handler
+    if os.environ.get("RUNPOD_LOCAL_TEST") == "1":
+        local_test()
+    else:
+        # Start the RunPod serverless handler
+        logger.info("Starting RunPod serverless handler")
+        runpod.serverless.start({"handler": handler})

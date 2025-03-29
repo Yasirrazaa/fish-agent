@@ -1,0 +1,9 @@
+{
+    "input": {
+        "message": "Hello, can you tell me about yourself?",
+        "system_message": "You are a helpful and friendly voice assistant created by Fish Audio. You speak in a clear and engaging manner.",
+        "conversation_id": "test-conversation-123",
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+}

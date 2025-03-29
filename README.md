@@ -131,3 +131,36 @@ We do not hold any responsibility for any illegal usage of the codebase. Please 
   <br>
   <a href="https://6block.com/">Data Processing sponsor by 6Block</a>
 </div>
+
+## Deploying as a RunPod API
+
+Fish Speech can be deployed as a serverless API endpoint on RunPod, making it accessible from any application or service.
+
+### Quick Deployment Steps
+
+1. **Build and push the Docker image**:
+   ```bash
+   docker build -f Dockerfile.runpod -t yourusername/fish-speech-runpod:latest .
+   docker push yourusername/fish-speech-runpod:latest
+   ```
+
+2. **Create a RunPod Serverless Endpoint**:
+   - Go to [RunPod Serverless](https://www.runpod.io/serverless)
+   - Click "New Endpoint"
+   - Select your Docker image
+   - Choose a GPU type (recommend at least 16GB VRAM)
+   - Configure any required environment variables
+   - Deploy!
+
+3. **Test your API**:
+   ```bash
+   python runpod/test_client.py \
+     --endpoint your-endpoint-id \
+     --api-key your-api-key \
+     --message "Hello, tell me a story"
+   ```
+
+See the [RunPod README](runpod/README.md) for detailed API documentation and code examples in various programming languages.
+
+
+
